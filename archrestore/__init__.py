@@ -66,3 +66,18 @@ from .materialize import (  # noqa: F401
     materialize,
     materialize_archive,
 )
+from .period import (  # noqa: F401
+    PERIOD_KIND,
+    PERIOD_MANIFEST_KIND,
+    FieldSpec,
+    MemberSpec,
+    PeriodDescriptor,
+    PeriodDescriptorError,
+    PeriodError,
+    PeriodValidationError,
+    RelationSpec,
+    load_period_descriptor,
+    parse_period_descriptor,
+    validate_period,
+    validate_period_package,
+)

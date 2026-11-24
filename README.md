@@ -79,6 +79,11 @@ python3 -m archrestore materialize \
 
 # Re-print the diagnosis of a run
 python3 -m archrestore report archive
+
+# Validate a periodic delivery group (members + relations) and, only when the
+# whole group is coherent, write an independently checkable period manifest
+python3 -m archrestore validate-period period.json \
+    --out period-manifest.json --problems diagnosis.jsonl
 ```
 
 `restore` prints per-slot status. Row counters in the JSON report are cell
@@ -168,6 +173,49 @@ streaming canonical copies rather than loading the dataset into memory.  See
 [`docs/MATERIALIZE.md`](docs/MATERIALIZE.md) for the package schema and CLI
 aliases.
 
+## Validating a periodic delivery group
+
+`validate-period` proves that a delivery's members — produced by separate
+flows, such as a device ledger and the inspection points referencing it —
+form one coherent group. A single JSON **period descriptor** lists the
+members and the relations between them:
+
+```json
+{
+  "archrestore_format": {"name": "archrestore-period-package", "version": 1},
+  "members": [
+    {"name": "devices", "kind": "archive", "path": "devices-archive",
+     "fields": [{"name": "device_id", "type": "integer"}]},
+    {"name": "points", "kind": "jsonl", "path": "points.jsonl",
+     "fields": [{"name": "device_ref", "type": "integer"}]}
+  ],
+  "relations": [
+    {"name": "points->devices",
+     "from": {"member": "points",  "fields": ["device_ref"]},
+     "to":   {"member": "devices", "fields": ["device_id"]}}
+  ]
+}
+```
+
+* Each relation pairs one or more fields on both sides; paired fields must
+  share a type. Composite keys are the fields' canonical encodings, so
+  equality is exact type-and-value equality (string `"1"` never equals
+  integer `1`).
+* Referenced keys must be **non-null and unique**, and every reference must
+  match **exactly one** referenced record. Malformed member records,
+  duplicate target keys, empty keys and unmatched/ambiguous references all
+  invalidate the period.
+* Diagnostics name the member, the relation and the original row (archive row
+  or JSONL line) and have one stable order. The full diagnosis is a JSONL
+  report (`--problems`); on failure no period manifest is written and an
+  existing output is left untouched.
+* On full success an **independently checkable period manifest** is written
+  atomically, with per-member content digests/summaries and per-relation
+  match counts. The check is out-of-core: bounded external sorts, a streaming
+  duplicate scan and a streaming merge join keep memory flat regardless of
+  member size. See [`docs/PERIOD.md`](docs/PERIOD.md) and FORMAT.md §9 for the
+  descriptor schema, failure taxonomy, digest definitions and exit codes.
+
 ## Contract at a glance
 
 | situation | reported as |
@@ -181,6 +229,9 @@ aliases.
 | ≥2 distinct decoded values | slot `disputed` (with samples) |
 | all rows agree but hash differs | slot `digest_mismatch` |
 | every slot confirmed | archive written, `restored` |
+| period descriptor malformed | `bad_period_descriptor`, exit `2`, nothing read |
+| duplicate/empty target key, unmatched/ambiguous reference, bad member record | `period_invalid`, exit `3`, no period manifest |
+| every member and relation passes | period manifest written, `period_valid` |
 
 ## Reproducing offline
 
@@ -204,10 +255,11 @@ archrestore/
   archive.py  archive writer, standalone verifier, random-access reader
   compare.py  out-of-core two-archive comparison and JSONL change ledger
   materialize.py bound JSONL package application and sorted next archive
+  period.py   out-of-core periodic group validation and period manifest
   pipeline.py orchestration, failure taxonomy, reporting
-  cli.py      restore / verify / query / report / compare / recheck
+  cli.py      restore / verify / query / report / compare / recheck / validate-period
   synth.py    deterministic synthetic datasets for tests and the demo
-tests/        unittest suite (format, repair, resources, randomised, CLI, compare)
+tests/        unittest suite (format, repair, resources, randomised, CLI, compare, period)
 ```
 
 ## Security posture

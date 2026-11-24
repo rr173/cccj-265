@@ -36,6 +36,11 @@ from .materialize import (
     archive_content_digest,
     materialize_archive,
 )
+from .period import (
+    PeriodDescriptorError,
+    PeriodValidationError,
+    validate_period_package,
+)
 from .pipeline import run_repair
 
 EXIT_OK = 0
@@ -556,6 +561,98 @@ def _cmd_digest(args):
     return EXIT_OK
 
 
+def _cmd_validate_period(args):
+    """Validate a periodic delivery group and write a period manifest."""
+    as_json = getattr(args, "json", False)
+    out_target = getattr(args, "out", None)
+    to_stdout = not out_target or out_target == "-"
+    try:
+        report = validate_period_package(
+            args.descriptor,
+            out=None if to_stdout else out_target,
+            base_dir=getattr(args, "base_dir", None),
+            verify_archives=bool(getattr(args, "verify", False)),
+            workdir=getattr(args, "workdir", None),
+            keep_work=getattr(args, "keep_work", False),
+            problems_out=getattr(args, "problems", None),
+            problem_limit=getattr(args, "problem_limit", 100),
+            run_records=getattr(args, "run_records", 4096),
+            run_bytes=getattr(args, "run_bytes", 4 * 1024 * 1024),
+        )
+    except PeriodValidationError as exc:
+        report = exc.report
+        if as_json:
+            json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True,
+                      indent=1)
+            sys.stdout.write("\n")
+        else:
+            sys.stdout.write("period validation failed: %s\n"
+                             % report.get("error"))
+            for p in report.get("problems", [])[:args.problem_limit]:
+                sys.stdout.write("problem: %s\n" % _format_period_problem(p))
+            sp = report.get("problems_path")
+            if sp:
+                sys.stdout.write("full problem report: %s\n" % sp)
+        return EXIT_INCOMPLETE
+    except PeriodDescriptorError as exc:
+        if as_json:
+            json.dump({"ok": False, "outcome": "bad_period_descriptor",
+                       "error_type": type(exc).__name__,
+                       "error": str(exc)}, sys.stdout, ensure_ascii=False,
+                      indent=1)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write("archrestore: %s\n" % exc)
+        return EXIT_BAD_INPUT
+    except ArchError as exc:
+        if as_json:
+            json.dump({"ok": False, "outcome": "bad_invocation",
+                       "error": str(exc)}, sys.stdout, ensure_ascii=False,
+                      indent=1)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write("archrestore: %s\n" % exc)
+        return EXIT_BAD_INPUT
+
+    if to_stdout:
+        # Keep stdout as a single clean JSON document (the manifest itself);
+        # the human summary then goes to stderr.
+        manifest_path = report["manifest_path"]
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            sys.stdout.write(fh.read())
+        if not as_json:
+            sys.stderr.write(
+                "period valid: %d member(s), %d relation(s)\n"
+                % (report["member_count"], report["relation_count"]))
+            sys.stderr.write("manifest digest: %s\n"
+                             % report["manifest_digest"])
+        return EXIT_OK
+    if as_json:
+        json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True,
+                  indent=1)
+        sys.stdout.write("\n")
+    elif not getattr(args, "quiet", False):
+        print("outcome: %s" % report["outcome"])
+        print("period manifest: %s" % report["manifest_path"])
+        print("manifest digest: %s" % report["manifest_digest"])
+        print("members:   %d" % report["member_count"])
+        print("relations: %d" % report["relation_count"])
+    return EXIT_OK
+
+
+def _format_period_problem(p):
+    parts = [p.get("kind", "?")]
+    if p.get("member"):
+        parts.append("member=%s" % p["member"])
+    if p.get("relation"):
+        parts.append("relation=%s" % p["relation"])
+    if p.get("row") is not None:
+        parts.append("row=%s" % p["row"])
+    if p.get("detail"):
+        parts.append(p["detail"])
+    return " ".join(parts)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="archrestore",
@@ -636,7 +733,53 @@ def build_parser():
     dg.add_argument("archive")
     dg.add_argument("--json", action="store_true")
     dg.set_defaults(func=_cmd_digest)
+
+    _add_validate_period_parser(sub, "validate-period")
+    _add_validate_period_parser(sub, "period", aliases=())
+    _add_validate_period_parser(
+        sub, "validate-package",
+        aliases=("validate-group", "period-validate", "check-period"))
     return p
+
+
+def _add_validate_period_parser(sub, name, aliases=None):
+    vp = sub.add_parser(
+        name, aliases=list(aliases or []),
+        help="validate a periodic delivery group and write a period manifest",
+        description="Validate the members and member relations described by a "
+                    "period package JSON descriptor. Writes an independently "
+                    "checkable period manifest only when every member and "
+                    "every referential relation passes.")
+    vp.add_argument("descriptor",
+                    help="JSON period package descriptor (members + relations)")
+    vp.add_argument("--out", "-o", "--output", "--manifest",
+                    dest="out", default=None,
+                    help="write the period manifest here atomically (default: "
+                         "stream the manifest JSON to stdout)")
+    vp.add_argument("--base-dir", "--basedir", dest="base_dir", default=None,
+                    help="resolve relative member paths against this directory "
+                         "(default: the descriptor's directory)")
+    vp.add_argument("--problems", "--problems-out", dest="problems",
+                    default=None,
+                    help="on failure, publish the full ordered JSONL diagnosis "
+                         "here")
+    vp.add_argument("--verify", dest="verify", action="store_true",
+                    default=False,
+                    help="fully self-verify every archive member first")
+    vp.add_argument("--no-verify", dest="verify", action="store_false",
+                    help="do not run archive self-verification (default)")
+    vp.add_argument("--workdir", "--temp-dir", dest="workdir", default=None,
+                    help="scratch directory for external sorts")
+    vp.add_argument("--keep-work", action="store_true", default=False)
+    vp.add_argument("--run-records", type=int, default=4096)
+    vp.add_argument("--run-bytes", type=int, default=4 * 1024 * 1024)
+    vp.add_argument("--problem-limit", type=int, default=100,
+                    help="max problems kept in the JSON/human report")
+    vp.add_argument("--json", action="store_true",
+                    help="print the report/manifest summary as JSON")
+    vp.add_argument("--quiet", "-q", action="store_true")
+    vp.set_defaults(func=_cmd_validate_period)
+    return vp
 
 
 def _add_materialize_parser(sub, name, aliases=None):

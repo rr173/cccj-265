@@ -267,11 +267,102 @@ integers.
 by compare ledgers and common patch formats; the fields above are the primary
 format.
 
-## 8. Exit status
+## 9. Period package (`archrestore-period-package`) and period manifest
+
+A periodic delivery is validated as a group. The receiver supplies one small
+JSON **period descriptor** naming the members and the relations between them;
+nothing is inferred from file names or layout.
+
+```json
+{
+  "archrestore_format": {"name": "archrestore-period-package", "version": 1},
+  "period_id": "2026-W48",
+  "members": [
+    {"name": "devices", "kind": "archive", "path": "devices-archive",
+     "fields": [{"name": "device_id", "type": "integer"}]},
+    {"name": "points", "kind": "jsonl", "path": "points.jsonl",
+     "fields": [{"name": "device_ref", "type": "integer"}]}
+  ],
+  "relations": [
+    {"name": "points->devices",
+     "from": {"member": "points",  "fields": ["device_ref"]},
+     "to":   {"member": "devices", "fields": ["device_id"]}}
+  ]
+}
+```
+
+### 9.1 Descriptor rules
+
+* The format is closed: unknown keys at any level are rejected, as are
+  duplicate member names and duplicate relation names.
+* A member is `kind: "archive"` (a restored archive directory, §6) or
+  `kind: "jsonl"` (UTF-8, one JSON object per non-empty line). Its `path` is
+  relative to the descriptor directory, must not be absolute, and must not
+  contain empty or `..` components. Its `fields` list is ordered, unique and
+  each entry is exactly `{name, type}` with `type` `string` or `integer`.
+* A relation's `from` (referencing) and `to` (referenced) endpoints each name
+  a declared member and an ordered, non-empty field list. The two lists have
+  the same length and are paired positionally; every paired field must have
+  the same declared type. Endpoint fields must exist on their member.
+* A missing descriptor, a malformed header, an unknown member/field, an
+  incompatible field-type pair or an illegal path is a **bad descriptor** and
+  aborts before any member is read.
+
+### 9.2 Key and equality semantics
+
+* A composite key is the concatenation, in declared order, of the fields'
+  canonical encodings of §1, which is injective for tuples.
+* Equality is exact type-and-value equality per field: string `"1"` and
+  integer `1` are different, and `null` is distinct from every other value.
+* A JSON scalar must belong to the field's declared type. Booleans are never
+  valid; a wrong-typed or out-of-i64 value is a field-type failure. An absent
+  field or an explicit `null` is a null key component.
+
+### 9.3 Group validity
+
+The period is valid only when, for every relation:
+
+1. every referenced-side composite key is non-null (a composite is empty only
+   when all its components are null) and unique;
+2. every referencing record's composite key is non-null and matches exactly
+   one referenced record.
+
+Member-level failures (an archive that cannot be opened or that lacks a
+declared field/type, or an unparseable JSONL record) also invalidate the
+period. Each diagnostic names the member, the relation (null for
+member-level findings) and the original row — the 0-based archive row or the
+1-based JSONL line number. The full diagnosis is emitted in one stable order
+(member, relation, problem kind, row). On any failure no period manifest is
+written and an existing destination is left untouched.
+
+### 9.4 Period manifest (`archrestore-period-manifest`)
+
+Written atomically only when the whole group is valid. It carries
+`status: "valid"`, the `period_id`, the descriptor's sha256, a self-covering
+`manifest_digest`, and per-member and per-relation summaries. Each member
+summary records its kind, resolved path, declared fields, record count,
+`source_sha256` and a domain-separated `content_digest`:
+
+* archive members use `archrestore/archive-content/v1`, the same digest as
+  the change-package baseline digest;
+* JSONL members use `archrestore/jsonl-content/v1`, computed as
+
+  ```
+  H = sha256("archrestore/jsonl-content/v1\0")
+  for each non-empty source line (raw stripped bytes b):
+      H.update(u64le(len(b))); H.update(b); H.update(b"\n")
+  digest = hex(H.digest())
+  ```
+
+Each relation summary records the field pairs with their types and the
+number of references and matched references, so the group can be re-checked
+independently of this tool.
+
+## 10. Exit status
 
 | code | meaning |
 |------|---------|
-| 0 | dataset restored and archive verified |
-| 2 | bad/unreadable manifest or invalid invocation |
-| 3 | at least one slot unconfirmed (missing / disputed / digest mismatch) |
+| 0 | dataset restored and archive verified; or compare/period check succeeded |
+| 2 | bad/unreadable manifest, spec or period descriptor; invalid invocation |
+| 3 | at least one slot unconfirmed (missing / disputed / digest mismatch), or a period member/relation failed validation |
 | 4 | archive written but failed independent self-verification |
