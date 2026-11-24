@@ -42,3 +42,14 @@ from .format import (  # noqa: F401
     parse_manifest,
     parse_replica,
 )
+from .compare import (  # noqa: F401
+    CompareError,
+    CompareSpecError,
+    CompareSchemaError,
+    CompareFailure,
+    CompareSpec,
+    CompareReport,
+    compare_archives,
+    iter_compare_events,
+    read_ledger,
+)

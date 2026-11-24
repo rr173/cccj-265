@@ -473,6 +473,16 @@ class ArchiveReader(object):
         reader.seek_row(row)
         return reader.next_value()
 
+    def column_cursor(self, name):
+        """A forward :class:`SpoolReader` over one column, row 0 onwards.
+
+        Additive streaming helper used by whole-archive scans (compare); the
+        caller drives exactly ``header["row_count"]`` ``next_value()`` calls.
+        Reuses the same block index and bounded pool as random access.
+        """
+        cmeta = self.column(name)
+        return self._spool(cmeta).reader(self.pool)
+
     def close(self):
         self.pool.close()
 

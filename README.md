@@ -61,6 +61,17 @@ python3 -m archrestore verify --archive archive
 # Read rows by original row number
 python3 -m archrestore query --archive archive --column device --rows 250:260
 
+# Compare two restored inspections into a JSONL change ledger
+cat > compare-spec.json <<'JSON'
+{"identity_fields": ["device_id"]}
+JSON
+python3 -m archrestore compare before-archive after-archive \
+    --spec compare-spec.json --out changes.jsonl
+
+# Re-verify a published ledger against the two archives
+python3 -m archrestore recheck changes.jsonl \
+    --before before-archive --after after-archive --spec compare-spec.json
+
 # Re-print the diagnosis of a run
 python3 -m archrestore report archive
 ```
@@ -89,6 +100,42 @@ The check index points each restored sub-interval at the original page and
 verified dictionary bytes it came from, so a reviewer can audit the result
 without trusting this tool's decoder.
 
+## Comparing two restored archives
+
+`compare` answers what changed between two restored inspections. Give it the
+two archive directories and a JSON spec listing one or more **identity
+fields**:
+
+```json
+{"identity_fields": ["rack", "device_id"]}
+```
+
+* The archives must share the same column names and types.
+* Identity is the tuple of the fields' **canonical values**. A null in any
+  identity field is an empty identity; identities must be unique in each
+  archive. Empty/duplicate identities abort the compare and are reported with
+  their original row numbers; no pairing is guessed and **no partial ledger is
+  published** (an existing `--out` file is left untouched).
+* Every other column is compared by exact type-and-value equality.
+* The JSONL ledger lists `added` / `removed` / `changed` identities in a
+  deterministic identity order. Changed entries list only the columns that
+  changed with both values; every entry carries the original row number on the
+  existing side, or `before_row`/`after_row` for changes. Unchanged devices
+  are omitted. Writes to `--out` are atomic (temp file + rename).
+* Comparison is **out of core**: identities are externally sorted and merged,
+  so neither archive nor the full identity/record set is loaded into memory;
+  peak Python allocation stays around 1 MiB for compact keys regardless of
+  row count. See [`docs/COMPARE.md`](docs/COMPARE.md) for the full schema,
+  memory contract and exit codes.
+
+```sh
+python3 -I examples/compare_demo.py /tmp/compare-demo 200   # generator
+bash examples/compare_example.sh /tmp/compare-sh 200        # full walkthrough
+```
+
+`recheck` independently re-runs the deterministic comparison and proves a
+published ledger is exactly the expected event sequence.
+
 ## Contract at a glance
 
 | situation | reported as |
@@ -106,7 +153,7 @@ without trusting this tool's decoder.
 ## Reproducing offline
 
 ```sh
-python3 -I -m unittest discover -s tests -v   # 53 tests, synthetic fixtures
+python3 -I -m unittest discover -s tests -v   # synthetic fixtures, incl. compare
 python3 -I examples/demo.py /tmp/demo          # three damaged replicas -> archive
 ```
 
@@ -123,10 +170,11 @@ archrestore/
   decode.py   single-pass page/dictionary verification and decoding
   resolve.py  segment sweep, row agreement, per-slot diagnosis
   archive.py  archive writer, standalone verifier, random-access reader
+  compare.py  out-of-core two-archive comparison and JSONL change ledger
   pipeline.py orchestration, failure taxonomy, reporting
-  cli.py      restore / verify / query / report
+  cli.py      restore / verify / query / report / compare / recheck
   synth.py    deterministic synthetic datasets for tests and the demo
-tests/        unittest suite (format, repair, resources, randomised, CLI)
+tests/        unittest suite (format, repair, resources, randomised, CLI, compare)
 ```
 
 ## Security posture
