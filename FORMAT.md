@@ -239,7 +239,35 @@ streamed, so values may exceed memory.
 replica/page each came from, plus the verified dictionary provenance. It is a
 check index, not a second copy of the data.
 
-## 7. Exit status
+## 7. JSONL change package
+
+A periodic change package is JSON Lines.  It binds itself to one baseline
+archive content digest and declares the identity fields:
+
+```json
+{"archrestore_format":{"name":"archrestore-change-package","version":1},
+ "baseline_digest":"<sha256 of baseline content>",
+ "identity_fields":["device_id"]}
+{"op":"add","identity":{"device_id":7},"row":{"device_id":7,"state":"new"}}
+{"op":"delete","identity":{"device_id":2}}
+{"op":"update","identity":{"device_id":3},"values":{"state":"seen"}}
+```
+
+Identity values use the same JSON scalar mapping as canonical text values:
+strings are JSON strings, integers are JSON numbers (never booleans), and
+`null` is not allowed in an identity field.  Add rows are complete rows;
+update values are a partial field map.  The receiver validates baseline
+identity non-nullness/uniqueness, exact one-row matching for delete/update,
+newness of add identities, and uniqueness of operated package identities
+before publishing a materialized archive.  Output rows are sorted by the
+composite identity using UTF-8 byte order for strings and numeric order for
+integers.
+
+`archrestore materialize` accepts several neighbouring field/op aliases used
+by compare ledgers and common patch formats; the fields above are the primary
+format.
+
+## 8. Exit status
 
 | code | meaning |
 |------|---------|

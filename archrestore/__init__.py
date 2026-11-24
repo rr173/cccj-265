@@ -53,3 +53,16 @@ from .compare import (  # noqa: F401
     iter_compare_events,
     read_ledger,
 )
+from .materialize import (  # noqa: F401
+    BaselineDigestError,
+    IdentityConflictError,
+    MaterializeError,
+    MaterializeVerificationError,
+    PackageFormatError,
+    apply_changes,
+    apply_package,
+    archive_content_digest,
+    baseline_digest,
+    materialize,
+    materialize_archive,
+)

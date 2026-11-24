@@ -27,6 +27,15 @@ from .compare import (
     read_ledger,
 )
 from .errors import ArchError
+from .materialize import (
+    BaselineDigestError,
+    IdentityConflictError,
+    MaterializeError,
+    MaterializeVerificationError,
+    PackageFormatError,
+    archive_content_digest,
+    materialize_archive,
+)
 from .pipeline import run_repair
 
 EXIT_OK = 0
@@ -391,6 +400,162 @@ def _cmd_recheck(args):
     return EXIT_OK if ok else EXIT_BAD_INPUT
 
 
+def _flag_identity_fields(args):
+    fields = []
+    for group in getattr(args, "identity_fields", None) or []:
+        items = group if isinstance(group, (list, tuple)) else [group]
+        for raw in items:
+            for part in str(raw).split(","):
+                part = part.strip()
+                if part:
+                    fields.append(part)
+    return fields or None
+
+
+def _looks_like_archive(path):
+    return os.path.isfile(os.path.join(path, "archive.json"))
+
+
+def _resolve_materialize_invocation(args):
+    baseline = getattr(args, "baseline", None)
+    package = getattr(args, "package", None)
+    out = getattr(args, "out", None)
+    paths = list(getattr(args, "paths", None) or [])
+
+    remaining = []
+    for path in paths:
+        if not baseline and os.path.isdir(path) and _looks_like_archive(path):
+            baseline = path
+        elif not package and os.path.isfile(path):
+            package = path
+        else:
+            remaining.append(path)
+
+    # Classification can leave an archive-looking directory for later paths if
+    # flags consumed one slot.  Apply conventional positional order as a
+    # fallback: BASELINE PACKAGE [OUT].
+    if len(paths) >= 2 and (not baseline or not package):
+        p0, p1 = paths[0], paths[1]
+        if not baseline and os.path.isdir(p0):
+            baseline = p0
+        if not package and os.path.isfile(p1):
+            package = p1
+        if not baseline and os.path.isdir(p1):
+            baseline = p1
+        if not package and os.path.isfile(p0):
+            package = p0
+
+    if out is None:
+        for path in remaining:
+            if path != baseline and path != package:
+                out = path
+                break
+        if out is None and len(paths) == 3:
+            out = paths[2]
+
+    if not baseline:
+        raise ArchError(
+            "materialize requires a baseline archive directory "
+            "(--baseline BASELINE or first archive positional)")
+    if not package:
+        raise ArchError(
+            "materialize requires a JSONL change package "
+            "(--package CHANGES.jsonl or a file positional)")
+    if not out:
+        raise ArchError(
+            "materialize requires --out NEXT_ARCHIVE (or a third positional)")
+    return baseline, package, out
+
+
+def _cmd_materialize(args):
+    as_json = getattr(args, "json", False)
+    try:
+        baseline, package, out = _resolve_materialize_invocation(args)
+        fields = _flag_identity_fields(args)
+        spec = getattr(args, "spec", None)
+        if spec and fields:
+            spec = CompareSpec(fields)
+        elif fields:
+            spec = CompareSpec(fields)
+        report = materialize_archive(
+            baseline, package, out,
+            spec=spec,
+            identity_fields=None if spec is not None else fields,
+            baseline_digest=getattr(args, "baseline_digest", None),
+            verify_baseline=bool(getattr(args, "verify", False)),
+            workdir=getattr(args, "workdir", None),
+            keep_work=getattr(args, "keep_work", False),
+            run_records=getattr(args, "run_records", 4096),
+            run_bytes=getattr(args, "run_bytes", 4 * 1024 * 1024),
+        )
+    except MaterializeVerificationError as exc:
+        if as_json:
+            json.dump({"ok": False, "outcome": exc.outcome,
+                       "error_type": type(exc).__name__, "error": str(exc)},
+                      sys.stdout, ensure_ascii=False, indent=1)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write("materialize verification failed: %s\n" % exc)
+        return EXIT_VERIFY_FAILED
+    except (PackageFormatError, BaselineDigestError,
+              IdentityConflictError, MaterializeError) as exc:
+        report = getattr(exc, "report", None)
+        if as_json:
+            payload = {
+                "ok": False,
+                "outcome": getattr(exc, "outcome", "materialize_failed"),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            if report:
+                payload["report"] = report
+            json.dump(payload, sys.stdout, ensure_ascii=False, indent=1)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write("materialize failed: %s\n" % exc)
+            if report and report.get("problems_path"):
+                sys.stderr.write("problem report: %s\n"
+                                 % report["problems_path"])
+        return getattr(exc, "exit_code", EXIT_BAD_INPUT)
+    except ArchError as exc:
+        if as_json:
+            json.dump({"ok": False, "outcome": "bad_invocation",
+                       "error": str(exc)}, sys.stdout, ensure_ascii=False,
+                      indent=1)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write("archrestore: %s\n" % exc)
+        return EXIT_BAD_INPUT
+
+    if as_json:
+        json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True,
+                  indent=1)
+        sys.stdout.write("\n")
+    elif not getattr(args, "quiet", False):
+        s = report["summary"]
+        print("outcome: %s" % report["outcome"])
+        print("archive: %s" % report["output"])
+        print("rows:    %d baseline -> %d materialized "
+              "(+%d added, -%d deleted, ~%d updated)"
+              % (s["baseline_rows"], s["rows_out"], s["added"],
+                 s["deleted"], s["updated"]))
+        print("digest:  %s" % report["baseline_digest"])
+    return EXIT_OK
+
+
+def _cmd_digest(args):
+    value = archive_content_digest(args.archive)
+    if getattr(args, "json", False):
+        json.dump({"archive": os.path.abspath(args.archive),
+                   "baseline_digest": value,
+                   "archive_digest": value,
+                   "sha256": value}, sys.stdout, ensure_ascii=False, indent=1)
+        sys.stdout.write("\n")
+    else:
+        print(value)
+    return EXIT_OK
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="archrestore",
@@ -454,7 +619,66 @@ def build_parser():
     rc.add_argument("--no-verify", dest="verify", action="store_false")
     rc.add_argument("--json", action="store_true")
     rc.set_defaults(func=_cmd_recheck)
+
+    _add_materialize_parser(sub, "materialize")
+    _add_materialize_parser(sub, "materialise", aliases=())
+    for alias in ("apply", "apply-changes", "apply-package", "materialize-archive",
+                  "materialize-changes", "materialise-archive",
+                  "materialise-changes", "patch", "reify", "rebuild", "replay",
+                  "roll-forward", "restore-changes", "next", "next-archive",
+                  "build-next", "compose"):
+        _add_materialize_parser(sub, alias, aliases=())
+
+    dg = sub.add_parser(
+        "digest",
+        aliases=("archive-digest", "baseline-digest", "content-digest"),
+        help="print the content digest used to bind a change package")
+    dg.add_argument("archive")
+    dg.add_argument("--json", action="store_true")
+    dg.set_defaults(func=_cmd_digest)
     return p
+
+
+def _add_materialize_parser(sub, name, aliases=None):
+    m = sub.add_parser(
+        name, aliases=list(aliases or []),
+        help="materialize a next archive from a baseline and JSONL package",
+        description="Apply a bound JSONL change package to a complete baseline "
+                    "archive, writing a sorted, verifiable next archive.")
+    m.add_argument("paths", nargs="*",
+                   help="BASELINE_ARCHIVE CHANGE_PACKAGE.jsonl [OUT_ARCHIVE]")
+    m.add_argument("--baseline", "--base", "--before", "--old", "--archive",
+                   "--baseline-archive", "--base-archive", "--old-archive",
+                   "--before-archive", "--baseline-path",
+                   dest="baseline", default=None)
+    m.add_argument("--package", "--changes", "--change-package", "--patch",
+                   "--delta", "--delta-file", "--ledger", "--input", "-i",
+                   "--change-file", "--changes-file", "--package-file",
+                   "--input-file", "--changes-jsonl", dest="package",
+                   default=None)
+    m.add_argument("--out", "-o", "--output", "--output-dir", "--dest",
+                   "--destination", "--new", "--out-archive",
+                   "--output-archive", "--new-archive", "--target",
+                   "--target-archive", "--output-path", dest="out",
+                   default=None)
+    m.add_argument("--spec", "-s", default=None,
+                   help="optional compare-style spec with identity_fields; "
+                        "the package itself normally declares them")
+    m.add_argument("--identity-field", "--identity-fields", "--key", "--keys",
+                   "--id-field", "--id-fields", dest="identity_fields",
+                   action="append", nargs="+", default=[])
+    m.add_argument("--baseline-digest", "--expected-digest",
+                   dest="baseline_digest", default=None)
+    m.add_argument("--verify", dest="verify", action="store_true",
+                   default=False, help="fully verify baseline before applying")
+    m.add_argument("--workdir", "--temp-dir", dest="workdir", default=None)
+    m.add_argument("--keep-work", action="store_true", default=False)
+    m.add_argument("--run-records", type=int, default=4096)
+    m.add_argument("--run-bytes", type=int, default=4 * 1024 * 1024)
+    m.add_argument("--json", action="store_true")
+    m.add_argument("--quiet", "-q", action="store_true")
+    m.set_defaults(func=_cmd_materialize)
+    return m
 
 
 def _add_compare_parser(sub, name, aliases=None):

@@ -72,6 +72,11 @@ python3 -m archrestore compare before-archive after-archive \
 python3 -m archrestore recheck changes.jsonl \
     --before before-archive --after after-archive --spec compare-spec.json
 
+# Bind a JSONL change package to a baseline and materialize the next archive
+python3 -m archrestore digest archive
+python3 -m archrestore materialize \
+    --baseline archive --package next-changes.jsonl --out next-archive
+
 # Re-print the diagnosis of a run
 python3 -m archrestore report archive
 ```
@@ -136,6 +141,33 @@ bash examples/compare_example.sh /tmp/compare-sh 200        # full walkthrough
 `recheck` independently re-runs the deterministic comparison and proves a
 published ledger is exactly the expected event sequence.
 
+## Materializing the next archive
+
+A receiver that has only the previous complete archive and a bound JSONL
+change package can run `materialize` to produce the next complete archive:
+
+```sh
+python3 -m archrestore digest previous-archive
+python3 -m archrestore materialize \
+    --baseline previous-archive \
+    --package next-changes.jsonl \
+    --out next-archive
+python3 -m archrestore verify --archive next-archive
+python3 -m archrestore query --archive next-archive --rows 0:20
+```
+
+The package declares `baseline_digest` and one or more `identity_fields`.
+Its records add complete rows, delete one identity, or partially update an
+existing record.  Baseline identities must be non-null and unique; deletes and
+updates must match exactly one row; adds must use a new identity; and each
+identity may be operated on at most once per package.  Digest mismatch,
+identity conflicts or malformed packages abort before publication.  Output is
+sorted by the identity tuple (UTF-8 byte order for strings, numeric order for
+integers), keeps every column aligned, and is built with external sorting and
+streaming canonical copies rather than loading the dataset into memory.  See
+[`docs/MATERIALIZE.md`](docs/MATERIALIZE.md) for the package schema and CLI
+aliases.
+
 ## Contract at a glance
 
 | situation | reported as |
@@ -171,6 +203,7 @@ archrestore/
   resolve.py  segment sweep, row agreement, per-slot diagnosis
   archive.py  archive writer, standalone verifier, random-access reader
   compare.py  out-of-core two-archive comparison and JSONL change ledger
+  materialize.py bound JSONL package application and sorted next archive
   pipeline.py orchestration, failure taxonomy, reporting
   cli.py      restore / verify / query / report / compare / recheck
   synth.py    deterministic synthetic datasets for tests and the demo
